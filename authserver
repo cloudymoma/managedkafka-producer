@@ -1,0 +1,91 @@
+#!/bin/bash 
+
+__usage() {
+    echo "Usage: authserver {install|start|stop|restart|status}"
+}
+
+__install() {
+    [ -d managedkafka ] || \
+        git clone https://github.com/googleapis/managedkafka.git
+
+    cd managedkafka && git pull
+
+    python -m pip install -U packaging urllib3 google-auth
+}
+
+__start() {
+    python managedkafka/kafka-auth-local-server/kafka_gcp_credentials_server.py \
+        > authserver.log 2>&1 &
+
+    if [ $? -eq 0 ]
+    then
+        PID=`ps -elf | egrep ""kafka_gcp_credentials_server | egrep -v "grep" | awk '{print $4}'`
+        echo "succeed, pid: $PID"
+    else
+        echo "failed."
+    fi
+}
+
+__stop() {
+    PID=`ps -elf | egrep ""kafka_gcp_credentials_server | egrep -v "grep" | awk '{print $4}'`
+
+    if [ -z "$PID" ]
+    then
+        echo "AuthServer is not running"
+    else
+        echo -n "Shutting down AuthServer... "
+
+        kill -9 $PID
+        if [ $? -eq 0 ]
+        then
+            echo "succeed."
+        else
+            echo "failed."
+
+        fi
+    fi
+}
+
+__status() {
+    PID=`ps -elf | egrep ""kafka_gcp_credentials_server | egrep -v "grep" | awk '{print $4}'`
+    if [ -z "$PID" ]
+    then
+        echo "AuthServer is not running"
+    else
+        echo "AuthServer is running, pid: $PID"
+    fi
+}
+
+__main() {
+    if [ $# -eq 0 ]
+    then
+        __usage
+    else
+        case $1 in
+            start)
+                __start
+                ;;
+            stop)
+                __stop
+                ;;
+            restart)
+                __stop
+                sleep 1
+                __start
+                ;;
+            status)
+                __status
+                ;;
+            install|i)
+                __install
+                ;;
+            *)
+                __usage
+                ;;
+        esac
+    fi
+}
+
+__main $@
+
+exit 0
