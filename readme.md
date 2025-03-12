@@ -36,7 +36,7 @@ you could check `authserver.log` for running information and errors, or pass
 
 - `topicName` is the Kafka Topic you want to send to
 - `"bootstrap.servers": "bootstrap.dingo-kafka.us-central1.managedkafka.du-hast-mich.cloud.goog:9092",` replace the value accordingly to your Kafka server
-- `time.Sleep(100 * time.Millisecond) // to avoid hitting the rate limit`, 1000 means 1 message per second per publisher, smaller number means higher producing rate. Completely turn this off could result 429 push back from Kafka. The program has the backoff strategy, so it shouldn't crash. Use it wisely.
+- `case <-time.After(100 * time.Millisecond):`, 1000 means 1 message per second per publisher, smaller number means higher producing rate. Completely turn this off could result 429 push back from Kafka. The program has the backoff strategy, so it shouldn't crash. Use it wisely.
 - *Optional*
   - `numPublishers` number of Kafka publishers concurrently
   - `numDataGenThreads` number of data generation threads, only increase the number if data pool is constantly empty which may potentially affect the publishing performance
