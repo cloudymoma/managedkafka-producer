@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -188,15 +189,16 @@ func addCommas(n int64) string {
 }
 
 func main() {
+	// Create a context that can be canceled for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure context is canceled in any case
+
 	// Replace with your project ID and topic ID
 	// projectID := "du-hast-mich"
 	// serviceAccountKeyFilePath := "/usr/local/google/home/binwu/workspace/google/sa.json"
 	// region := "us-central1"
 	// clusterName := "dingo-kafka"
 	topicName := "dingo-topic"
-
-	// Create a new Pub/Sub client.
-	// ctx := context.Background()
 
 	// https://github.com/googleapis/managedkafka/blob/eee84856cc5e27e27c7041da2eead03cba71e019/README.md
 	kafkaProducer, err := kafka.NewProducer(&kafka.ConfigMap{
@@ -233,13 +235,25 @@ func main() {
 	// Status reporting goroutine (non-blocking)
 	go func() {
 		for {
-			poolLen := dataPool.Len()
-			totalSent := atomic.LoadInt64(&totalMessagesPublished) // Non-blocking read
+			select {
+			case <-ctx.Done():
+				// Context canceled, exit the goroutine
+				return
+			default:
+				poolLen := dataPool.Len()
+				totalSent := atomic.LoadInt64(&totalMessagesPublished) // Non-blocking read
 
-			// log.Printf("DataPool size: %d, Total messages published: %d", poolLen, totalSent)
-			log.Printf("DataPool size: %s, Total messages published: %s", addCommas(poolLen), addCommas(totalSent))
+				// log.Printf("DataPool size: %d, Total messages published: %d", poolLen, totalSent)
+				log.Printf("DataPool size: %s, Total messages published: %s", addCommas(poolLen), addCommas(totalSent))
 
-			time.Sleep(3 * time.Second)
+				// Use a ticker with select to make it responsive to shutdown
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+					// Continue the loop
+				}
+			}
 		}
 	}()
 
@@ -275,16 +289,29 @@ func main() {
 		go func(threadID int) {
 			defer wgDataGen.Done()
 			for {
-				// Check if the pool is full
-				if dataPool.Len() >= poolSize { // Pool is full
-					log.Printf("Thread %d: DataPool is full, current size: %s, Waiting...",
-						threadID, addCommas(dataPool.Len()))
-					time.Sleep(1000 * time.Millisecond) // Pause briefly
-					continue                            // Skip this iteration
-				}
+				select {
+				case <-ctx.Done():
+					// Context canceled, exit the goroutine immediately
+					log.Printf("Thread %d: Data generation stopping due to shutdown signal", threadID)
+					return
+				default:
+					// Check if the pool is full
+					if dataPool.Len() >= poolSize { // Pool is full
+						log.Printf("Thread %d: DataPool is full, current size: %s, Waiting...",
+							threadID, addCommas(dataPool.Len()))
+						// Use a ticker with select to make it responsive to shutdown
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(1000 * time.Millisecond):
+							// Continue the loop
+						}
+						continue // Skip this iteration
+					}
 
-				// Put the item into the pool.
-				dataPool.Put(datagen())
+					// Put the item into the pool.
+					dataPool.Put(datagen())
+				}
 			}
 		}(i)
 	}
@@ -295,28 +322,54 @@ func main() {
 	for i := 0; i < numWorkers; i++ {
 		go func(publisherChID int, ch chan *kafka.Message) {
 			defer wgWorkers.Done()
-			for { // Infinite loop to continuously consume from dataPool and produce to Kafka
-				item := dataPool.Get()
-
-				jsonData, err := json.Marshal(item)
-				if err != nil {
-					log.Printf("Publisher %d: Failed to marshal JSON: %v", publisherChID, err)
-					continue
-				}
-
-				msg := &kafka.Message{
-					TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
-					Value:          jsonData,
-				}
-
-				// Non-blocking send to Kafka channel with retry on full queue
+			for { // Loop to continuously consume from dataPool and produce to Kafka
 				select {
-				case ch <- msg: // Try to send to Kafka
+				case <-ctx.Done():
+					// Context canceled, exit the goroutine
+					log.Printf("Worker %d: Stopping due to shutdown signal", publisherChID)
+					return
 				default:
-					// Kafka channel is full.  Wait and retry.
-					log.Println("Publisher channel is full, waiting...")
-					time.Sleep(1 * time.Second)
-					ch <- msg // Requeue on the *same* channel.
+					item := dataPool.Get()
+
+					jsonData, err := json.Marshal(item)
+					if err != nil {
+						log.Printf("Publisher %d: Failed to marshal JSON: %v", publisherChID, err)
+						continue
+					}
+
+					msg := &kafka.Message{
+						TopicPartition: kafka.TopicPartition{Topic: &topicName, Partition: kafka.PartitionAny},
+						Value:          jsonData,
+					}
+
+					// Non-blocking send to Kafka channel with retry on full queue
+					select {
+					case <-ctx.Done():
+						// Put the item back in the pool if we're shutting down
+						//dataPool.Put(item)
+						return
+					case ch <- msg: // Try to send to Kafka
+						// Successfully sent to channel
+					default:
+						// Kafka channel is full. Wait and retry.
+						log.Println("Publisher channel is full, waiting...")
+						select {
+						case <-ctx.Done():
+							// Put the item back in the pool if we're shutting down
+							//dataPool.Put(item)
+							return
+						case <-time.After(1 * time.Second):
+							// Try again after waiting
+						}
+						// Try again after the wait
+						select {
+						case <-ctx.Done():
+							//dataPool.Put(item)
+							return
+						case ch <- msg: // Requeue on the *same* channel. ignore if channel is full
+							// Successfully sent
+						}
+					}
 				}
 			}
 		}(i, publisherChs[i]) // Pass the dedicated channel
@@ -334,15 +387,34 @@ func main() {
 					if err.(kafka.Error).Code() == kafka.ErrQueueFull {
 						// fmt.Println("Producer queue is full, waiting...")
 						log.Printf("Publisher %d: Kafka producer queue full: %v", publisherID, err)
-						time.Sleep(1 * time.Second)
-						// Important:  Re-send on the SAME channel.
-						ch <- msg // Requeue on the *same* channel.
+						// Use a ticker with select to make it responsive to shutdown
+						select {
+						case <-ctx.Done():
+							// If shutting down, don't requeue, just log and continue to process remaining messages
+							log.Printf("Publisher %d: Shutdown in progress, dropping message due to full queue", publisherID)
+						case <-time.After(1 * time.Second):
+							// Important: Re-send on the SAME channel.
+							select {
+							case <-ctx.Done():
+								// If shutting down, don't requeue
+								log.Printf("Publisher %d: Shutdown in progress, dropping message", publisherID)
+							case ch <- msg:
+								// Requeue on the *same* channel.
+							}
+						}
 						continue
 					}
 					log.Printf("Failed to produce message: %v\n", err)
 				}
-				time.Sleep(100 * time.Millisecond) // to avoid hitting the rate limit
+				// Use a ticker with select to make it responsive to shutdown
+				select {
+				case <-ctx.Done():
+					// If shutting down, process remaining messages faster
+				case <-time.After(100 * time.Millisecond):
+					// Normal rate limiting
+				}
 			}
+			log.Printf("Publisher %d: Finished processing all queued messages", publisherID)
 		}(i, publisherChs[i]) // Pass the dedicated channel to each publisher
 	}
 
@@ -350,35 +422,42 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		sig := <-sigChan // Block until a signal is received
-		log.Printf("Received signal: %v. Shutting down...", sig)
+	// Block until a signal is received
+	sig := <-sigChan
+	log.Printf("Received signal: %v. Initiating graceful shutdown...", sig)
 
-		// Close all publisher channels.  This signals the publisher goroutines to exit.
-		for _, ch := range publisherChs {
-			close(ch)
-		}
+	// Step 1: Cancel the context to stop data generation immediately
+	cancel()
+	log.Println("Signaled all goroutines to stop")
 
-		// Wait for data generation to finish
-		wgDataGen.Wait()
-		// Wait for publishers to finish.
-		wgPublishers.Wait()
-		wgWorkers.Wait()
-
-		kafkaProducer.Flush(15 * 1000) // Flush any remaining messages.
-
-		log.Println("Graceful shutdown complete.")
-		os.Exit(0)
-	}()
-
-	// Wait for data generation to finish
+	// Step 2: Wait for data generation to finish
+	log.Println("Waiting for data generation goroutines to stop...")
 	wgDataGen.Wait()
-	// Wait for publishers to finish.
-	wgPublishers.Wait()
+	log.Println("Data generation stopped successfully")
+
+	// Step 3: Wait for workers to finish
+	log.Println("Waiting for worker goroutines to finish...")
 	wgWorkers.Wait()
+	log.Println("Worker goroutines stopped successfully")
 
-	kafkaProducer.Flush(15 * 1000) // Flush any remaining messages.
+	// Step 4: Close all publisher channels to signal publisher goroutines to exit
+	log.Println("Closing publisher channels...")
+	for i, ch := range publisherChs {
+		log.Printf("Closing publisher channel %d", i)
+		close(ch)
+	}
 
-	log.Println("Finished publishing messages (interrupted).")
+	// Step 5: Wait for publishers to finish processing remaining messages
+	log.Println("Waiting for publishers to finish processing remaining messages...")
+	wgPublishers.Wait()
+	log.Println("All publishers finished successfully")
+
+	// Step 6: Flush any remaining messages in the Kafka producer
+	log.Println("Flushing Kafka producer...")
+	remainingMessages := kafkaProducer.Flush(15 * 1000)
+	log.Printf("Kafka producer flushed. %d messages might have been lost", remainingMessages)
+
+	// Final cleanup
+	log.Println("Graceful shutdown complete.")
 	os.Exit(0)
 }
