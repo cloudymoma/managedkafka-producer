@@ -342,32 +342,26 @@ func main() {
 						Value:          jsonData,
 					}
 
-					// Non-blocking send to Kafka channel with retry on full queue
-					select {
-					case <-ctx.Done():
-						// Put the item back in the pool if we're shutting down
-						//dataPool.Put(item)
-						return
-					case ch <- msg: // Try to send to Kafka
-						// Successfully sent to channel
-					default:
-						// Kafka channel is full. Wait and retry.
-						log.Println("Publisher channel is full, waiting...")
+					// Send to Kafka channel with retry and proper item handling on shutdown/failure
+					sent := false
+					for !sent {
 						select {
 						case <-ctx.Done():
-							// Put the item back in the pool if we're shutting down
-							//dataPool.Put(item)
-							return
-						case <-time.After(1 * time.Second):
-							// Try again after waiting
-						}
-						// Try again after the wait
-						select {
-						case <-ctx.Done():
-							//dataPool.Put(item)
-							return
-						case ch <- msg: // Requeue on the *same* channel. ignore if channel is full
-							// Successfully sent
+							log.Printf("Worker %d: Shutdown signal received, returning item to pool.", publisherChID)
+							dataPool.Put(item)
+							return // Exit goroutine
+						case ch <- msg:
+							sent = true // Successfully sent
+						default: // Channel ch is full
+							log.Printf("Worker %d: Output channel is full, waiting to retry...", publisherChID)
+							select {
+							case <-ctx.Done():
+								log.Printf("Worker %d: Shutdown signal received during wait for output channel, returning item to pool.", publisherChID)
+								dataPool.Put(item)
+								return // Exit goroutine
+							case <-time.After(1 * time.Second):
+								// Loop again to retry sending
+							}
 						}
 					}
 				}
@@ -382,29 +376,36 @@ func main() {
 		go func(publisherID int, ch chan *kafka.Message) {
 			defer wgPublishers.Done()
 			for msg := range ch {
-				err = kafkaProducer.Produce(msg, nil)
-				if err != nil {
-					if err.(kafka.Error).Code() == kafka.ErrQueueFull {
-						// fmt.Println("Producer queue is full, waiting...")
-						log.Printf("Publisher %d: Kafka producer queue full: %v", publisherID, err)
-						// Use a ticker with select to make it responsive to shutdown
-						select {
-						case <-ctx.Done():
-							// If shutting down, don't requeue, just log and continue to process remaining messages
-							log.Printf("Publisher %d: Shutdown in progress, dropping message due to full queue", publisherID)
-						case <-time.After(1 * time.Second):
-							// Important: Re-send on the SAME channel.
+				// New retry logic for Produce:
+				produced := false
+				for !produced {
+					// Before attempting to produce, check if context is already done.
+					if ctx.Err() != nil {
+						log.Printf("Publisher %d: Context done before producing message for topic %s, dropping.", publisherID, *msg.TopicPartition.Topic)
+						break // Break from the retry loop, message is dropped.
+					}
+
+					err := kafkaProducer.Produce(msg, nil) // Use local err to avoid conflict with outer scope
+					if err != nil {
+						kafkaErr, ok := err.(kafka.Error)
+						if ok && kafkaErr.Code() == kafka.ErrQueueFull {
+							log.Printf("Publisher %d: Kafka producer queue full, waiting to retry for message to topic %s...", publisherID, *msg.TopicPartition.Topic)
+							// Wait for 1 second or until context is done
 							select {
 							case <-ctx.Done():
-								// If shutting down, don't requeue
-								log.Printf("Publisher %d: Shutdown in progress, dropping message", publisherID)
-							case ch <- msg:
-								// Requeue on the *same* channel.
+								log.Printf("Publisher %d: Shutdown signal received while producer queue full (waiting to retry), dropping message for topic %s.", publisherID, *msg.TopicPartition.Topic)
+								produced = true // Mark as "handled" (dropped) to break the retry loop.
+							case <-time.After(1 * time.Second):
+								// Loop again to retry Produce
 							}
+						} else {
+							log.Printf("Publisher %d: Failed to produce message to topic %s: %v", publisherID, *msg.TopicPartition.Topic, err)
+							produced = true // Mark as "handled" (failed) to break the retry loop.
 						}
-						continue
+					} else {
+						produced = true // Successfully produced
+						// log.Printf("Publisher %d: Successfully produced message to topic %s", publisherID, *msg.TopicPartition.Topic)
 					}
-					log.Printf("Failed to produce message: %v\n", err)
 				}
 				// Use a ticker with select to make it responsive to shutdown
 				select {
