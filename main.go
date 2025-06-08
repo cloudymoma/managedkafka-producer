@@ -200,7 +200,7 @@ func main() {
 	// clusterName := "dingo-kafka"
 	topicName := "dingo-topic"
 
-	// https://github.com/googleapis/managedkafka/blob/eee84856cc5e27e27c7041da2eead03cba71e019/README.md
+	// https://github.com/googleapis/managedkafka/blob/main/README.md
 	kafkaProducer, err := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers":                   "bootstrap.dingo-kafka.us-central1.managedkafka.du-hast-mich.cloud.goog:9092",
 		"security.protocol":                   "SASL_SSL",
