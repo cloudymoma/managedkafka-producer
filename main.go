@@ -288,6 +288,10 @@ func main() {
 	for i := 0; i < numDataGenThreads; i++ {
 		go func(threadID int) {
 			defer wgDataGen.Done()
+			currentBackoff := 1 * time.Second
+			maxBackoff := 20 * time.Second
+			initialBackoff := 1 * time.Second
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -297,20 +301,27 @@ func main() {
 				default:
 					// Check if the pool is full
 					if dataPool.Len() >= poolSize { // Pool is full
-						log.Printf("Thread %d: DataPool is full, current size: %s, Waiting...",
-							threadID, addCommas(dataPool.Len()))
-						// Use a ticker with select to make it responsive to shutdown
+						log.Printf("Thread %d: DataPool is full, current size: %s. Waiting for %v...",
+							threadID, addCommas(dataPool.Len()), currentBackoff)
+						// Use a timer with select to make it responsive to shutdown
 						select {
 						case <-ctx.Done():
 							return
-						case <-time.After(1000 * time.Millisecond):
+						case <-time.After(currentBackoff):
 							// Continue the loop
 						}
-						continue // Skip this iteration
+						// Increase backoff for next time, up to maxBackoff
+						currentBackoff *= 2
+						if currentBackoff > maxBackoff {
+							currentBackoff = maxBackoff
+						}
+						continue // Skip this iteration, try again after backoff
 					}
 
-					// Put the item into the pool.
+					// Pool is not full, put the item into the pool.
 					dataPool.Put(datagen())
+					// Reset backoff duration since we successfully added an item
+					currentBackoff = initialBackoff
 				}
 			}
 		}(i)
@@ -322,6 +333,10 @@ func main() {
 	for i := 0; i < numWorkers; i++ {
 		go func(publisherChID int, ch chan *kafka.Message) {
 			defer wgWorkers.Done()
+			currentBackoff := 1 * time.Second
+			maxBackoff := 20 * time.Second
+			initialBackoff := 1 * time.Second
+
 			for { // Loop to continuously consume from dataPool and produce to Kafka
 				select {
 				case <-ctx.Done():
@@ -333,7 +348,8 @@ func main() {
 
 					jsonData, err := json.Marshal(item)
 					if err != nil {
-						log.Printf("Publisher %d: Failed to marshal JSON: %v", publisherChID, err)
+						log.Printf("Worker %d: Failed to marshal JSON: %v", publisherChID, err) // Corrected log prefix
+						dataPool.Put(item)                                                      // Return item to pool if marshalling fails
 						continue
 					}
 
@@ -351,15 +367,21 @@ func main() {
 							dataPool.Put(item)
 							return // Exit goroutine
 						case ch <- msg:
-							sent = true // Successfully sent
+							sent = true                     // Successfully sent
+							currentBackoff = initialBackoff // Reset backoff on successful send
 						default: // Channel ch is full
-							log.Printf("Worker %d: Output channel is full, waiting to retry...", publisherChID)
+							log.Printf("Worker %d: Output channel is full, waiting for %v to retry...", publisherChID, currentBackoff)
 							select {
 							case <-ctx.Done():
 								log.Printf("Worker %d: Shutdown signal received during wait for output channel, returning item to pool.", publisherChID)
 								dataPool.Put(item)
 								return // Exit goroutine
-							case <-time.After(1 * time.Second):
+							case <-time.After(currentBackoff):
+								// Increase backoff for next time, up to maxBackoff
+								currentBackoff *= 2
+								if currentBackoff > maxBackoff {
+									currentBackoff = maxBackoff
+								}
 								// Loop again to retry sending
 							}
 						}
@@ -375,47 +397,59 @@ func main() {
 	for i := 0; i < numPublishers; i++ {
 		go func(publisherID int, ch chan *kafka.Message) {
 			defer wgPublishers.Done()
+			initialBackoff := 100 * time.Millisecond
+			maxBackoff := 20 * time.Second
+			currentBackoff := initialBackoff
+
 			for msg := range ch {
-				// New retry logic for Produce:
 				produced := false
 				for !produced {
 					// Before attempting to produce, check if context is already done.
 					if ctx.Err() != nil {
-						log.Printf("Publisher %d: Context done before producing message for topic %s, dropping.", publisherID, *msg.TopicPartition.Topic)
+						// log.Printf("Publisher %d: Context done, dropping message for topic %s.", publisherID, *msg.TopicPartition.Topic)
 						break // Break from the retry loop, message is dropped.
 					}
 
 					err := kafkaProducer.Produce(msg, nil) // Use local err to avoid conflict with outer scope
 					if err != nil {
 						kafkaErr, ok := err.(kafka.Error)
-						if ok && kafkaErr.Code() == kafka.ErrQueueFull {
-							log.Printf("Publisher %d: Kafka producer queue full, waiting to retry for message to topic %s...", publisherID, *msg.TopicPartition.Topic)
-							// Wait for 1 second or until context is done
+						// Retriable errors: client queue full, broker throttling, or other general retriable errors.
+						// isRetriable := ok && (kafkaErr.Code() == kafka.ErrQueueFull || kafkaErr.Code() == kafka.ErrThrottle || kafkaErr.IsRetriable())
+						// https://github.com/confluentinc/confluent-kafka-go/blob/master/kafka/generated_errors.go
+						isRetriable := ok &&
+							(kafkaErr.Code() == kafka.ErrQueueFull ||
+								kafkaErr.Code() == kafka.ErrRequestTimedOut ||
+								kafkaErr.Code() == kafka.ErrThrottlingQuotaExceeded ||
+								kafkaErr.IsRetriable())
+
+						if isRetriable {
+							log.Printf("Publisher %d: Retriable error producing to topic %s (Error: %v). Waiting %v before retry...",
+								publisherID, *msg.TopicPartition.Topic, kafkaErr, currentBackoff)
 							select {
 							case <-ctx.Done():
-								log.Printf("Publisher %d: Shutdown signal received while producer queue full (waiting to retry), dropping message for topic %s.", publisherID, *msg.TopicPartition.Topic)
+								log.Printf("Publisher %d: Shutdown signal received while backing off, dropping message for topic %s.", publisherID, *msg.TopicPartition.Topic)
 								produced = true // Mark as "handled" (dropped) to break the retry loop.
-							case <-time.After(1 * time.Second):
+							case <-time.After(currentBackoff):
+								// Increase backoff for next attempt
+								currentBackoff *= 2
+								if currentBackoff > maxBackoff {
+									currentBackoff = maxBackoff
+								}
 								// Loop again to retry Produce
 							}
 						} else {
-							log.Printf("Publisher %d: Failed to produce message to topic %s: %v", publisherID, *msg.TopicPartition.Topic, err)
+							log.Printf("Publisher %d: Non-retriable error producing message to topic %s: %v. Dropping message.", publisherID, *msg.TopicPartition.Topic, err)
 							produced = true // Mark as "handled" (failed) to break the retry loop.
 						}
 					} else {
-						produced = true // Successfully produced
+						produced = true                 // Successfully produced
+						currentBackoff = initialBackoff // Reset backoff on success
 						// log.Printf("Publisher %d: Successfully produced message to topic %s", publisherID, *msg.TopicPartition.Topic)
 					}
 				}
-				// Use a ticker with select to make it responsive to shutdown
-				select {
-				case <-ctx.Done():
-					// If shutting down, process remaining messages faster
-				case <-time.After(100 * time.Millisecond):
-					// Normal rate limiting
-				}
+				// The previous rate limiter (time.After(100 * time.Millisecond)) has been removed.
 			}
-			log.Printf("Publisher %d: Finished processing all queued messages", publisherID)
+			log.Printf("Publisher %d: Channel closed, exiting.", publisherID)
 		}(i, publisherChs[i]) // Pass the dedicated channel to each publisher
 	}
 
