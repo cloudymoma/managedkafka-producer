@@ -209,6 +209,21 @@ func main() {
 		"sasl.oauthbearer.client.id":          "unused",
 		"sasl.oauthbearer.client.secret":      "unused",
 		"sasl.oauthbearer.method":             "oidc",
+		//linger.ms allows the producer to wait for a specified duration to batch messages together before sending them.
+		//This can improve throughput and reduce the load on the Kafka brokers,
+		//and may help reduce occurrences of ErrQueueFull if the producer is trying to send many small messages rapidly.
+		"linger.ms": "500", // Example: Linger for 50ms to allow batching
+		// Performance tuning parameters
+		"compression.type":                      "lz4",                   // Compression codec: none, gzip, snappy, lz4, zstd
+		"acks":                                  "all",                   // Acknowledgement: 0, 1, all (-1)
+		"batch.size":                            "524288",                // 512KB batch size
+		"max.in.flight.requests.per.connection": "5",                     // Maximum in-flight requests per connection
+		"enable.idempotence":                    "true",                  // Enable idempotence for exactly-once semantics
+		"client.id":                             "managedkafka-producer", // Client ID for logging and monitoring
+		"topic.metadata.refresh.interval.ms":    "60000",                 // Refresh topic metadata every 60 seconds
+		"request.timeout.ms":                    "30000",                 // Request timeout for produce requests
+		"retries":                               "5",                     // Number of retries for transient errors
+		"retry.backoff.ms":                      "1000",                  // Backoff time between retries
 	})
 	if err != nil {
 		log.Fatalf("Failed to create producer: %v", err)
